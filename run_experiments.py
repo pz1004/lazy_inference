@@ -598,6 +598,10 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
     # --- BranchyNet ---
     if should_run("branchynet"):
         num_classes = int(len(np.unique(y_train)))
+        LOGGER.info(
+            "[DEBUG] BranchyNet setup for %s: X_train=%s, num_classes=%d, unique_labels=%s",
+            spec.name, X_train.shape, num_classes, np.unique(y_train)
+        )
         ee_results = run_early_exit_baseline(
             X_train,
             y_train,

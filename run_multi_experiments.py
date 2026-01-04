@@ -104,6 +104,7 @@ def run_multiple_experiments(args: argparse.Namespace, result_dir: Path) -> pd.D
     records: List[Dict[str, any]] = []
     dataset_keys = [ds.lower() for ds in args.datasets]
     for run_idx in range(args.runs):
+        print(f"[INFO] {run_idx+1}/{args.runs} - Starting experiment run with seed offset {run_idx}")
         iteration_args = _prepare_single_run_args(args, run_idx)
         for key in dataset_keys:
             if key not in DATASET_REGISTRY:

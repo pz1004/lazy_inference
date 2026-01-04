@@ -100,7 +100,7 @@ class LazyRF(BaseEstimator, ClassifierMixin):
     def __init__(
         self,
         base_estimator: BaseEstimator,
-        threshold: float = 0.99,
+        threshold: float = 0.95,
         min_trees: int = 10,
         block_size: int = 10,
         fast_start_trees: Optional[int] = None,
@@ -233,7 +233,7 @@ class LazyRF(BaseEstimator, ClassifierMixin):
             for tree_idx in range(start_idx, end_idx):
                 tree = self.estimators_[tree_idx]
                 preds = tree.predict(X_block)
-                mapped = np.array([self._label_to_index(pred) for pred in preds])
+                mapped = np.searchsorted(self.classes_, preds)
                 valid = mapped >= 0
                 if np.any(valid):
                     np.add.at(alphas, (sample_idx[valid], mapped[valid]), 1)
@@ -257,7 +257,7 @@ class LazyRF(BaseEstimator, ClassifierMixin):
             hybrid_cutoff = max(self.min_trees, n_trees // 2)
             for tree in self.estimators_[:hybrid_cutoff]:
                 preds = tree.predict(X)
-                mapped = np.array([self._label_to_index(pred) for pred in preds])
+                mapped = np.searchsorted(self.classes_, preds)
                 valid = mapped >= 0
                 if np.any(valid):
                     np.add.at(alphas, (np.arange(n_samples)[valid], mapped[valid]), 1)
