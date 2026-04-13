@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.stats import t
 
 
 # ----------------------------------------------------------------------
@@ -41,77 +42,85 @@ FIG_DIR = Path("figures")
 TABLE_DIR.mkdir(parents=True, exist_ok=True)
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Plot style tuned for academic papers (journal quality)
+# Plot style tuned for IEEE Access journal quality
+# Meets publication standards for font, sizing, and output quality
 plt.rcParams.update({
-    # Figure
+    # Figure DPI and output
     "figure.dpi": 300,
     "figure.facecolor": "white",
-    "savefig.dpi": 300,
+    "savefig.dpi": 600,  # 600 dpi for publication
     "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.05,
-
-    # Font settings (use serif for journals)
-    "font.family": "serif",
-    "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
-    "font.size": 10,
-    "axes.labelsize": 11,
-    "axes.titlesize": 11,
+    "savefig.pad_inches": 0.02,  # Minimal padding
+    "savefig.format": "png",
+    
+    # Font settings: Times New Roman for IEEE Access
+    "font.family": 'sans-serif',
+    "font.sans-serif": ['Source Sans 3', 'Helvetica', 'Arial', 'DejaVu Sans'],
+    "font.size": 8,  # Base font size
+    "axes.labelsize": 8,        # Axis labels: 8 pt
+    "axes.titlesize": 9,        # Subplot titles: 9 pt (a), (b), etc.
     "axes.titleweight": "bold",
-    "legend.fontsize": 9,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
+    "legend.fontsize": 7,       # Legend: 7 pt
+    "xtick.labelsize": 7,       # Tick labels: 7 pt
+    "ytick.labelsize": 7,
 
-    # Axes
-    "axes.linewidth": 0.8,
+    # Axes styling
+    "axes.linewidth": 0.5,      # Thinner axis lines
     "axes.grid": True,
     "axes.grid.which": "major",
-    "axes.axisbelow": True,
+    "axes.axisbelow": True,     # Grid behind bars
     "grid.linestyle": "--",
     "grid.linewidth": 0.4,
-    "grid.alpha": 0.5,
-    "axes.spines.top": False,
+    "grid.alpha": 0.3,          # Light gridlines
+    "axes.spines.top": False,   # Remove top/right spines
     "axes.spines.right": False,
+    "axes.spines.left": True,
+    "axes.spines.bottom": True,
 
-    # Ticks
-    "xtick.major.width": 0.8,
-    "ytick.major.width": 0.8,
-    "xtick.major.size": 4,
-    "ytick.major.size": 4,
-    "xtick.direction": "out",
-    "ytick.direction": "out",
+    # Ticks: inward, ~3 pt length
+    "xtick.major.width": 0.5,
+    "ytick.major.width": 0.5,
+    "xtick.major.size": 3,      # 3 pt tick length
+    "ytick.major.size": 3,
+    "xtick.direction": "in",    # Inward ticks
+    "ytick.direction": "in",
+    "xtick.minor.size": 0,
+    "ytick.minor.size": 0,
 
     # Lines and markers
-    "lines.linewidth": 1.5,
-    "lines.markersize": 6,
+    "lines.linewidth": 1.0,
+    "lines.markersize": 5,
 
-    # Error bars
-    "errorbar.capsize": 3,
+    # Error bars: 2 pt cap, 0.75 pt linewidth
+    "errorbar.capsize": 2,
 })
 
-# Color palette for methods (colorblind-friendly)
+# Color palette: Okabe-Ito colorblind-friendly palette
+# Distinguishable by people with color blindness (protanopia, deuteranopia, tritanopia)
 METHOD_COLORS = {
-    "Baseline A - Full RF": "#1f77b4",        # blue
-    "Baseline B - Fixed Cascade": "#ff7f0e",  # orange
-    "Cascade RF (Two-Stage)": "#2ca02c",      # green
-    "LazyRF": "#d62728",                       # red
-    "Baseline C - QuickScorer": "#9467bd",    # purple
-    "Full GBM": "#8c564b",                     # brown
-    "LazyGBM": "#e377c2",                      # pink
-    "Baseline D - Full BranchyNet": "#7f7f7f", # gray
-    "Baseline D - Early Exit BranchyNet": "#bcbd22",  # olive
+    "Baseline A - Full RF": "#0173B2",        # blue
+    "Baseline B - Fixed Cascade": "#DE8F05",  # orange
+    "Cascade RF (Two-Stage)": "#CC78BC",      # purple
+    "LazyRF": "#CA9161",                       # tan
+    "Baseline C - QuickScorer": "#56B4E9",    # light blue
+    "Full GBM": "#029E73",                     # green
+    "LazyGBM": "#ECE133",                      # yellow
+    "Baseline D - Full BranchyNet": "#D5A6BD", # light purple
+    "Baseline D - Early Exit BranchyNet": "#999933",  # olive
 }
 
-# Hatching patterns for additional distinction (optional for B&W printing)
+# Simplified hatching patterns: max 4 distinct styles for B&W printing
+# Differentiate primarily by color, secondarily by hatch
 METHOD_HATCHES = {
-    "Baseline A - Full RF": "",
-    "Baseline B - Fixed Cascade": "//",
-    "Cascade RF (Two-Stage)": "\\\\",
-    "LazyRF": "",
-    "Baseline C - QuickScorer": "xx",
-    "Full GBM": "",
-    "LazyGBM": "..",
-    "Baseline D - Full BranchyNet": "++",
-    "Baseline D - Early Exit BranchyNet": "||",
+    "Baseline A - Full RF": "",        # no hatch
+    "Baseline B - Fixed Cascade": "//", # diagonal
+    "Cascade RF (Two-Stage)": "",       # no hatch
+    "LazyRF": "",                       # no hatch
+    "Baseline C - QuickScorer": "\\\\\\\\",   # diagonal (other direction)
+    "Full GBM": "",                    # no hatch
+    "LazyGBM": "..",                   # dots
+    "Baseline D - Full BranchyNet": "xx",  # cross-hatch
+    "Baseline D - Early Exit BranchyNet": "++",  # plus
 }
 
 # Canonical method ordering for plots / tables
@@ -184,12 +193,15 @@ def compute_summary(df: pd.DataFrame,
     grouped = grouped.reset_index()
     grouped = grouped.rename(columns={"run_count": "n"})
 
-    # Add 95% CI columns
+    # Add 95% CI columns using the Student-t critical value for the observed run count.
+    critical = pd.Series(t.ppf(0.975, grouped["n"] - 1), index=grouped.index)
+    critical = critical.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    critical = critical.where(grouped["n"] > 1, 0.0)
     for m in metrics:
         mean_col = f"{m}_mean"
         std_col = f"{m}_std"
         ci_col = f"{m}_ci95"
-        grouped[ci_col] = 1.96 * grouped[std_col] / np.sqrt(grouped["n"])
+        grouped[ci_col] = critical * grouped[std_col] / np.sqrt(grouped["n"])
 
     return grouped
 
@@ -388,7 +400,7 @@ def make_sweep_tables(sweep_df: pd.DataFrame) -> None:
         ]].copy()
         gbm_table = gbm_table.rename(columns={
             "dataset": "Dataset",
-            "lazy_gbm_threshold": "SPRT threshold",
+            "lazy_gbm_threshold": "Stability threshold $\\gamma$",
             "accuracy_tex": "Accuracy (mean $\\pm$ 95\\% CI)",
             "work_tex": "Avg. work units",
             "energy_tex": "Relative work reduction",
@@ -412,34 +424,41 @@ def plot_metric_by_method_2x2(perf_summary: pd.DataFrame,
                               metric: str,
                               ylabel: str,
                               filename: str,
-                              show_legend: bool = True) -> None:
+                              show_legend: bool = False) -> None:
     """
-    Create a 2x2 subplot figure (journal quality):
-      - Each panel: one dataset
-      - Bars: methods (with 95% CI error bars)
-      - Uses consistent colors and hatching for B&W printing
-      - Shared legend at bottom
+    Create a 2x2 subplot figure meeting IEEE Access publication standards:
+      - Each panel: one dataset labeled (a), (b), (c), (d) in lowercase
+      - Bars: single unified color (steel blue) with 95% CI error bars
+      - Method names labeled on x-axis (rotated for readability)
+      - Cropped y-axis ranges, light horizontal gridlines
+      - Proper font sizing: subplot titles 9pt, axis labels 8pt, ticks 7pt
+      - Bar edges: black, linewidth 0.5
+      - Error bars: cap size 2pt, linewidth 0.75pt
+      - Export as PDF (vector) and 600 dpi PNG
     """
     datasets = sorted(perf_summary["dataset"].unique())
     n_datasets = len(datasets)
 
-    # Set up 2x2 grid with proper sizing for two-column journal format
-    # Extra height for legend at bottom
-    fig, axes = plt.subplots(2, 2, figsize=(7.5, 7.0))
+    # IEEE Access double-column figure width: 7.16 inches
+    # Height adjusted for 2×2 grid (no legend space needed)
+    fig, axes = plt.subplots(2, 2, figsize=(7.16, 4.8))
     axes_flat = axes.flatten()
 
-    # Global y-limits for shared comparison
-    all_means = perf_summary[f"{metric}_mean"].values
-    all_cis = perf_summary[f"{metric}_ci95"].values
-    y_min = max(0.0, (all_means - all_cis).min() * 0.95)
-    y_max = (all_means + all_cis).max() * 1.05
-    if metric == "accuracy":
-        y_max = min(1.0, y_max)
+    # Per-dataset y-limits to crop to data range (avoid wasting space)
+    # Compute dataset-specific ranges
+    dataset_limits = {}
+    for dataset in datasets:
+        sub = perf_summary[perf_summary["dataset"] == dataset]
+        means = sub[f"{metric}_mean"].values
+        cis = sub[f"{metric}_ci95"].values
+        y_min = max(0.0, (means - cis).min() * 0.98)  # Small margin below min
+        y_max = (means + cis).max() * 1.02            # Small margin above max
+        if metric == "accuracy":
+            y_max = min(1.0, y_max)
+        dataset_limits[dataset] = (y_min, y_max)
 
-    # Track methods for legend (preserve order)
-    legend_handles = []
-    legend_labels = []
-    seen_methods = set()
+    # Single unified color for all bars (steel blue)
+    bar_color = "#4472C4"
 
     for idx, dataset in enumerate(datasets):
         ax = axes_flat[idx]
@@ -451,78 +470,70 @@ def plot_metric_by_method_2x2(perf_summary: pd.DataFrame,
         ci = sub[f"{metric}_ci95"].values
         methods = sub["method"].tolist()
 
-        # Get colors and hatches for each method
-        colors = [METHOD_COLORS.get(m, "#333333") for m in methods]
-        hatches = [METHOD_HATCHES.get(m, "") for m in methods]
-
-        # Draw bars with individual colors and hatches
+        # Draw bars with single unified color and black edges (0.5 pt)
         bar_width = 0.7
-        bars = ax.bar(x, means, width=bar_width, color=colors,
-                      edgecolor="black", linewidth=0.8)
+        bars = ax.bar(x, means, width=bar_width, color=bar_color,
+                      edgecolor="black", linewidth=0.5)  # 0.5 pt edges
 
-        # Apply hatching patterns and collect legend handles
-        for bar, hatch, method in zip(bars, hatches, methods):
-            bar.set_hatch(hatch)
-            if method not in seen_methods:
-                seen_methods.add(method)
-                legend_handles.append(bar)
-                legend_labels.append(short_label(method))
-
-        # Add error bars separately for better control
+        # Add error bars: 2 pt cap, 0.75 pt linewidth
         ax.errorbar(x, means, yerr=ci, fmt='none', color='black',
-                    capsize=3, capthick=0.8, elinewidth=0.8)
+                    capsize=2, capthick=0.75, elinewidth=0.75)  # 0.75 pt lines
 
-        # Subplot title (dataset name)
+        # Subplot title: lowercase letters (a), (b), etc., 9 pt bold
         ax.set_title(f"({chr(97 + idx)}) {dataset}", fontweight='bold', pad=8)
 
-        # Hide x-tick labels (legend serves this purpose)
+        # Display method names on x-axis only for bottom row (bottom-left: idx 2, bottom-right: idx 3)
         ax.set_xticks(x)
-        ax.set_xticklabels([])
+        if idx >= 2:  # Bottom row only
+            method_labels = [short_label(m) for m in methods]
+            ax.set_xticklabels(method_labels, rotation=45, ha='right', fontsize=7)
+        else:  # Top row: no x-axis labels
+            ax.set_xticklabels([])
 
-        # Y-axis label on left column only
+        # Y-axis label on left column only (8 pt via rcParams)
         if idx % 2 == 0:
             ax.set_ylabel(ylabel)
 
-        # Apply consistent y-limits
-        ax.set_ylim(y_min, y_max)
+        # Apply dataset-specific y-limits (cropped to data range)
+        # y_min, y_max = dataset_limits[dataset]
+        # ax.set_ylim(y_min, y_max)
+        if metric == "accuracy":
+            ax.set_ylim(0.7, 1.0)
+        else:
+            ax.set_ylim(0, 100)
 
-        # Remove top and right spines (already in rcParams but ensure)
+        # Ensure light horizontal gridlines are visible
+        ax.grid(axis='y', linestyle='--', alpha=0.3, zorder=0)
+
+        # Remove top and right spines for clean appearance
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(0.5)
+        ax.spines['bottom'].set_linewidth(0.5)
 
     # Hide unused subplots if fewer than 4 datasets
     for j in range(n_datasets, 4):
         fig.delaxes(axes_flat[j])
 
-    # Reorder legend handles/labels by METHOD_ORDER
-    sorted_pairs = sorted(
-        zip(legend_handles, legend_labels),
-        key=lambda x: method_sort_key(
-            next((k for k, v in SHORT_METHOD_LABELS.items() if v == x[1]), x[1])
-        )
+    # Adjust layout (no legend space needed)
+    fig.tight_layout()
+    plt.subplots_adjust(hspace=0.35, wspace=0.25)
+
+    # Save as both PDF (vector) and high-resolution PNG
+    # PDF: vector format with embedded fonts for publication
+    fig.savefig(
+        FIG_DIR / f"{filename}.pdf",
+        format='pdf',
+        bbox_inches='tight',
+        pad_inches=0.01,
     )
-    legend_handles, legend_labels = zip(*sorted_pairs) if sorted_pairs else ([], [])
-
-    # Add shared legend at bottom
-    if show_legend and legend_handles:
-        fig.legend(
-            legend_handles, legend_labels,
-            loc='lower center',
-            ncol=min(4, len(legend_handles)),
-            bbox_to_anchor=(0.5, -0.02),
-            frameon=True,
-            fancybox=False,
-            edgecolor='black',
-            fontsize=8,
-        )
-
-    # Adjust layout with space for legend
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
-    plt.subplots_adjust(hspace=0.25, wspace=0.15)
-
-    # Save as both PDF (vector) and PNG (raster)
-    fig.savefig(FIG_DIR / f"{filename}.pdf", format='pdf', bbox_inches='tight')
-    fig.savefig(FIG_DIR / f"{filename}.png", dpi=300, bbox_inches='tight')
+    # PNG: 600 dpi for print-quality raster
+    fig.savefig(
+        FIG_DIR / f"{filename}.png",
+        dpi=600,
+        bbox_inches='tight',
+        pad_inches=0.01,
+    )
     plt.close(fig)
 
 

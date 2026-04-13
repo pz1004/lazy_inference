@@ -12,7 +12,7 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -109,6 +109,7 @@ class BaselineResult:
     predictions: NDArray
     model: Any
     metadata: Dict[str, Any]
+    scores: Optional[NDArray] = None
 
 
 def run_baseline_full_rf(
@@ -134,6 +135,9 @@ def run_baseline_full_rf(
     y_pred_full = rf_full.predict(X_test)
     inf_time = time.time() - inf_start
     acc = accuracy_score(y_test, y_pred_full)
+    scores = None
+    if len(rf_full.classes_) == 2 and hasattr(rf_full, "predict_proba"):
+        scores = rf_full.predict_proba(X_test)[:, 1]
     return BaselineResult(
         name="Baseline A - Full RF",
         accuracy=acc,
@@ -142,6 +146,7 @@ def run_baseline_full_rf(
         predictions=y_pred_full,
         model=rf_full,
         metadata={"train_time": train_time},
+        scores=scores,
     )
 
 
@@ -174,6 +179,7 @@ def run_fixed_cascade_baseline(
     trees_used = np.full(n_samples, n_trees, dtype=int)
     active = np.ones(n_samples, dtype=bool)
     checkpoints_info: List[Dict[str, float]] = []
+    positive_scores = np.full(n_samples, np.nan, dtype=np.float64) if n_classes == 2 else None
 
     prev_checkpoint = 0
     for ckpt, tau in zip(checkpoints, thresholds):
@@ -195,6 +201,8 @@ def run_fixed_cascade_baseline(
         if np.any(confident_mask):
             exiting = active_indices[confident_mask]
             final_preds[exiting] = rf_model.classes_[np.argmax(votes[exiting], axis=1)]
+            if positive_scores is not None:
+                positive_scores[exiting] = votes[exiting, 1] / max(ckpt, 1)
             trees_used[exiting] = ckpt
             active[exiting] = False
 
@@ -206,6 +214,8 @@ def run_fixed_cascade_baseline(
     if np.any(active):
         remaining = np.where(active)[0]
         final_preds[remaining] = rf_model.classes_[np.argmax(votes[remaining], axis=1)]
+        if positive_scores is not None:
+            positive_scores[remaining] = votes[remaining, 1] / max(n_trees, 1)
 
     inf_time = time.time() - start_eval
     acc = accuracy_score(y_test, final_preds)
@@ -218,6 +228,7 @@ def run_fixed_cascade_baseline(
         predictions=final_preds,
         model=rf_model,
         metadata={"checkpoints": checkpoints, "thresholds": thresholds, "stage_stats": checkpoints_info},
+        scores=positive_scores,
     )
 
 
@@ -226,19 +237,29 @@ def cascade_predict(
     stage2_model: RandomForestClassifier,
     X: NDArray,
     confidence_threshold: float = 0.8,
-) -> Tuple[NDArray, float, NDArray]:
+) -> Tuple[NDArray, float, NDArray, Optional[NDArray]]:
     """Two-stage cascade inference helper."""
     preds_s1 = stage1_model.predict_proba(X)
     max_probs = np.max(preds_s1, axis=1)
     final_preds = np.empty(X.shape[0], dtype=stage2_model.classes_.dtype)
     mask_hard = max_probs < confidence_threshold
+    positive_scores = np.full(X.shape[0], np.nan, dtype=np.float64) if len(stage2_model.classes_) == 2 else None
     if np.any(~mask_hard):
         class_indices = np.argmax(preds_s1[~mask_hard], axis=1)
         final_preds[~mask_hard] = stage1_model.classes_[class_indices]
+        if positive_scores is not None:
+            positive_scores[~mask_hard] = preds_s1[~mask_hard, 1]
     if np.any(mask_hard):
-        final_preds[mask_hard] = stage2_model.predict(X[mask_hard])
+        if hasattr(stage2_model, "predict_proba"):
+            preds_s2 = stage2_model.predict_proba(X[mask_hard])
+            class_indices = np.argmax(preds_s2, axis=1)
+            final_preds[mask_hard] = stage2_model.classes_[class_indices]
+            if positive_scores is not None:
+                positive_scores[mask_hard] = preds_s2[:, 1]
+        else:
+            final_preds[mask_hard] = stage2_model.predict(X[mask_hard])
     avg_trees = stage1_model.n_estimators + (np.mean(mask_hard) * stage2_model.n_estimators)
-    return final_preds, avg_trees, mask_hard
+    return final_preds, avg_trees, mask_hard, positive_scores
 
 
 def run_cascade_baseline(
@@ -257,7 +278,7 @@ def run_cascade_baseline(
     )
     rf_stage1.fit(X_train, y_train)
     start_time = time.time()
-    y_pred, avg_trees, mask_hard = cascade_predict(rf_stage1, stage2_model, X_test, threshold)
+    y_pred, avg_trees, mask_hard, scores = cascade_predict(rf_stage1, stage2_model, X_test, threshold)
     inf_time = time.time() - start_time
     acc = accuracy_score(y_test, y_pred)
     return BaselineResult(
@@ -268,6 +289,7 @@ def run_cascade_baseline(
         predictions=y_pred,
         model=(rf_stage1, stage2_model),
         metadata={"stage1_trees": stage1_trees, "threshold": threshold, "hard_fraction": float(np.mean(mask_hard))},
+        scores=scores,
     )
 
 
@@ -348,6 +370,7 @@ class QuickScorerForest:
         self.classes_ = rf_model.classes_
         self.class_mapper = ClassIndexMapper(self.classes_)
         self.last_fallback_rate = 0.0
+        self.last_scores: Optional[NDArray] = None
 
     def predict(self, X: NDArray) -> NDArray:
         votes = np.zeros((X.shape[0], len(self.classes_)), dtype=np.float32)
@@ -358,6 +381,7 @@ class QuickScorerForest:
                 votes[idx, class_idx] += 1
         total_fallbacks = sum(tree.fallbacks for tree in self.trees)
         self.last_fallback_rate = total_fallbacks / max(X.shape[0] * len(self.trees), 1)
+        self.last_scores = votes[:, 1] / max(len(self.trees), 1) if len(self.classes_) == 2 else None
         return self.classes_[np.argmax(votes, axis=1)]
 
 
@@ -380,6 +404,7 @@ def run_quickscorer_baseline(
         predictions=preds,
         model=qs_forest,
         metadata={"description": "Bitmask traversal across features", "fallback_rate": qs_forest.last_fallback_rate},
+        scores=qs_forest.last_scores,
     )
 
 
@@ -445,7 +470,7 @@ def early_exit_inference(
     model: EarlyExitMLP,
     X: torch.Tensor,
     thresholds: Tuple[float, float],
-) -> Tuple[NDArray, float, Dict[str, float]]:
+) -> Tuple[NDArray, float, Dict[str, float], Optional[NDArray]]:
     """Apply early-exit policy and report exit fractions."""
     model.eval()
     with torch.no_grad():
@@ -463,6 +488,12 @@ def early_exit_inference(
         final_preds = pred_final.clone()
         final_preds[mask2] = pred2[mask2]
         final_preds[mask1] = pred1[mask1]
+        scores = None
+        if prob_final.shape[1] == 2:
+            scores_t = prob_final[:, 1].clone()
+            scores_t[mask2] = prob2[mask2, 1]
+            scores_t[mask1] = prob1[mask1, 1]
+            scores = scores_t.cpu().numpy()
         depth = np.full(X.shape[0], 3.0)
         depth[mask2.cpu().numpy()] = 2.0
         depth[mask1.cpu().numpy()] = 1.0
@@ -473,7 +504,7 @@ def early_exit_inference(
             "exit2_fraction": exit2_frac,
             "final_fraction": max(0.0, 1.0 - exit1_frac - exit2_frac),
         }
-        return final_preds.cpu().numpy(), float(np.mean(depth)), metadata
+        return final_preds.cpu().numpy(), float(np.mean(depth)), metadata, scores
 
 
 def run_early_exit_baseline(
@@ -495,6 +526,7 @@ def run_early_exit_baseline(
     model.eval()
     start_full = time.time()
     _, _, out_final = model(X_test_t)
+    prob_final = torch.softmax(out_final, dim=1)
     pred_final = torch.argmax(out_final, dim=1).cpu().numpy()
     time_full = time.time() - start_full
     acc_full = accuracy_score(y_test_remapped, pred_final)
@@ -506,9 +538,10 @@ def run_early_exit_baseline(
         predictions=pred_final + label_offset,
         model=model,
         metadata={"exit": "final_only"},
+        scores=prob_final[:, 1].detach().cpu().numpy() if prob_final.shape[1] == 2 else None,
     )
     start_lazy = time.time()
-    y_pred_lazy, avg_depth, exit_meta = early_exit_inference(model, X_test_t, thresholds)
+    y_pred_lazy, avg_depth, exit_meta, lazy_scores = early_exit_inference(model, X_test_t, thresholds)
     time_lazy = time.time() - start_lazy
     acc_lazy = accuracy_score(y_test_remapped, y_pred_lazy)
     lazy_result = BaselineResult(
@@ -519,5 +552,6 @@ def run_early_exit_baseline(
         predictions=y_pred_lazy + label_offset,
         model=model,
         metadata={"thresholds": thresholds, **exit_meta},
+        scores=lazy_scores,
     )
     return {"full": full_result, "early_exit": lazy_result}

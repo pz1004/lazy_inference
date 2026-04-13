@@ -4,7 +4,7 @@ Run multiple experimental repetitions and summarize results.
 This script wraps `run_experiments.py` functionality to:
 1. Execute experiments N times, saving raw results for every dataset/method/run.
 2. Compute descriptive statistics (mean, std, 95% CI) and print them.
-3. Emit a LaTeX Table 1 summarizing Accuracy, Avg Trees, and Energy Reduction.
+3. Emit a LaTeX Table 1 summarizing Accuracy, Avg Trees, and Work Reduction.
 4. Plot Figure 1 (Efficiency Curve) comparing Avg Trees across datasets.
 
 Usage example:
@@ -24,6 +24,7 @@ from typing import Dict, Iterable, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import t
 
 import run_experiments as rex
 from run_experiments import (
@@ -74,29 +75,63 @@ def _flatten_report(dataset: str, report: Dict[str, any], run_idx: int) -> List[
     (when available) so that threshold sweeps can be analyzed later.
     """
     rows: List[Dict[str, any]] = []
+    metadata_fields = [
+        "threshold",
+        "min_trees",
+        "block_size",
+        "work_p50",
+        "work_p90",
+        "work_p95",
+        "work_p99",
+        "mean_stop_score",
+        "median_stop_score",
+        "spr_threshold",
+        "variant",
+        "enable_ratio_heuristic",
+        "ratio_threshold",
+        "enable_flip_heuristic",
+        "multiclass_flip_scale",
+        "enable_late_margin_fallback",
+        "late_margin_fraction",
+        "mean_abs_margin_at_stop",
+        "median_abs_margin_at_stop",
+        "mean_flip_score",
+        "stop_posterior_threshold_fraction",
+        "stop_full_evaluation_fraction",
+        "stop_certificate_fraction",
+        "stop_ratio_heuristic_fraction",
+        "stop_flip_score_fraction",
+        "stop_late_margin_fraction",
+    ]
     for entry in report["results"]:
         if "metrics" not in entry:
             continue
         metrics = entry["metrics"]
         meta = entry.get("metadata") or {}
-        lazy_rf_thr = meta.get("threshold")
-        lazy_gbm_thr = meta.get("spr_threshold")
-        rows.append(
-            {
-                "dataset": dataset,
-                "run": run_idx,
-                "method": entry["name"],
-                "accuracy": entry["accuracy"],
-                "inference_time": entry["inference_time"],
-                "avg_work_units": entry["avg_work_units"],
-                "speedup": metrics.get("speedup"),
-                "accuracy_drop": metrics.get("accuracy_drop"),
-                "energy_reduction": metrics.get("energy_reduction"),
-                "worst_case_latency": metrics.get("worst_case_latency"),
-                "lazy_rf_threshold": lazy_rf_thr,
-                "lazy_gbm_threshold": lazy_gbm_thr,
-            }
-        )
+        method_name = entry["name"]
+        lazy_rf_thr = meta.get("threshold") if method_name.startswith("LazyRF") else None
+        lazy_gbm_thr = meta.get("spr_threshold") if method_name.startswith("LazyGBM") else None
+        row = {
+            "dataset": dataset,
+            "run": run_idx,
+            "method": method_name,
+            "accuracy": entry["accuracy"],
+            "inference_time": entry["inference_time"],
+            "avg_work_units": entry["avg_work_units"],
+            "speedup": metrics.get("speedup"),
+            "accuracy_drop": metrics.get("accuracy_drop"),
+            "disagreement_rate": metrics.get("disagreement_rate"),
+            "energy_reduction": metrics.get("energy_reduction"),
+            "work_reduction": metrics.get("work_reduction", metrics.get("energy_reduction")),
+            "worst_case_latency": metrics.get("worst_case_latency"),
+            "auroc": metrics.get("auroc"),
+            "auprc": metrics.get("auprc"),
+            "lazy_rf_threshold": lazy_rf_thr,
+            "lazy_gbm_threshold": lazy_gbm_thr,
+        }
+        for field in metadata_fields:
+            row[field] = meta.get(field)
+        rows.append(row)
     return rows
 
 
@@ -110,13 +145,20 @@ def run_multiple_experiments(args: argparse.Namespace, result_dir: Path) -> pd.D
             if key not in DATASET_REGISTRY:
                 print(f"[WARN] Unknown dataset '{key}', skipping.")
                 continue
-            ensure_dataset_prereqs(key, iteration_args)
             spec = DATASET_REGISTRY[key]
-            report = run_single_dataset(spec, iteration_args)
-            records.extend(_flatten_report(spec.name, report, run_idx))
-            # Force garbage collection after each dataset to prevent memory buildup
-            del report
-            gc.collect()
+            try:
+                ensure_dataset_prereqs(key, iteration_args)
+                report = run_single_dataset(spec, iteration_args)
+                records.extend(_flatten_report(spec.name, report, run_idx))
+                del report
+            except Exception as err:  # pragma: no cover - long-run resilience
+                print(
+                    f"[ERROR] run={run_idx} dataset={spec.name} failed: {err}. "
+                    "Continuing with remaining datasets/runs."
+                )
+            finally:
+                # Force garbage collection after each dataset to prevent memory buildup
+                gc.collect()
         # Additional cleanup after each full run iteration
         gc.collect()
         try:
@@ -136,18 +178,39 @@ def run_multiple_experiments(args: argparse.Namespace, result_dir: Path) -> pd.D
 
 def compute_statistics(df: pd.DataFrame) -> pd.DataFrame:
     grouped = df.groupby(["dataset", "method"])
+    agg_spec = {
+        "accuracy_mean": ("accuracy", "mean"),
+        "accuracy_std": ("accuracy", "std"),
+        "avg_work_mean": ("avg_work_units", "mean"),
+        "avg_work_std": ("avg_work_units", "std"),
+        "disagree_mean": ("disagreement_rate", "mean"),
+        "disagree_std": ("disagreement_rate", "std"),
+        "energy_mean": ("energy_reduction", "mean"),
+        "energy_std": ("energy_reduction", "std"),
+        "count": ("accuracy", "count"),
+    }
+    optional_metrics = {
+        "work_p50_mean": "work_p50",
+        "work_p90_mean": "work_p90",
+        "work_p95_mean": "work_p95",
+        "work_p99_mean": "work_p99",
+        "stop_full_eval_mean": "stop_full_evaluation_fraction",
+        "auroc_mean": "auroc",
+        "auprc_mean": "auprc",
+    }
+    for out_col, source_col in optional_metrics.items():
+        if source_col in df.columns:
+            agg_spec[out_col] = (source_col, "mean")
     summary = grouped.agg(
-        accuracy_mean=("accuracy", "mean"),
-        accuracy_std=("accuracy", "std"),
-        avg_work_mean=("avg_work_units", "mean"),
-        avg_work_std=("avg_work_units", "std"),
-        energy_mean=("energy_reduction", "mean"),
-        energy_std=("energy_reduction", "std"),
-        count=("accuracy", "count"),
+        **agg_spec
     )
-    summary["accuracy_ci"] = 1.96 * summary["accuracy_std"] / np.sqrt(summary["count"])
-    summary["avg_work_ci"] = 1.96 * summary["avg_work_std"] / np.sqrt(summary["count"])
-    summary["energy_ci"] = 1.96 * summary["energy_std"] / np.sqrt(summary["count"])
+    critical = pd.Series(t.ppf(0.975, summary["count"] - 1), index=summary.index)
+    critical = critical.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    critical = critical.where(summary["count"] > 1, 0.0)
+    summary["accuracy_ci"] = critical * summary["accuracy_std"] / np.sqrt(summary["count"])
+    summary["avg_work_ci"] = critical * summary["avg_work_std"] / np.sqrt(summary["count"])
+    summary["disagree_ci"] = critical * summary["disagree_std"] / np.sqrt(summary["count"])
+    summary["energy_ci"] = critical * summary["energy_std"] / np.sqrt(summary["count"])
     summary = summary.fillna(0.0)
     return summary
 
@@ -161,6 +224,9 @@ def print_statistics(summary: pd.DataFrame) -> None:
         work_mean = row["avg_work_mean"]
         work_std = row["avg_work_std"]
         work_ci = row["avg_work_ci"]
+        disagree_mean = row["disagree_mean"]
+        disagree_std = row["disagree_std"]
+        disagree_ci = row["disagree_ci"]
         energy_mean = row["energy_mean"]
         energy_std = row["energy_std"]
         energy_ci = row["energy_ci"]
@@ -168,7 +234,8 @@ def print_statistics(summary: pd.DataFrame) -> None:
             f"[{dataset} | {method}] "
             f"Accuracy={acc_mean:.4f}±{acc_std:.4f} (CI ±{acc_ci:.4f}), "
             f"AvgWork={work_mean:.2f}±{work_std:.2f} (CI ±{work_ci:.2f}), "
-            f"EnergyRed={energy_mean*100:.2f}%±{energy_std*100:.2f}% (CI ±{energy_ci*100:.2f}%)"
+            f"Disagree={disagree_mean:.4f}±{disagree_std:.4f} (CI ±{disagree_ci:.4f}), "
+            f"WorkRed={energy_mean*100:.2f}%±{energy_std*100:.2f}% (CI ±{energy_ci*100:.2f}%)"
         )
 
 
@@ -179,7 +246,7 @@ def build_latex_table(summary: pd.DataFrame) -> str:
         "\\caption{Table 1: Main Results}",
         "\\begin{tabular}{l l c c c}",
         "\\toprule",
-        "Dataset & Method & Accuracy & Avg Trees (Work) & Energy Reduction \\\\",
+        "Dataset & Method & Accuracy & Avg Trees (Work) & Work Reduction \\\\",
         "\\midrule",
     ]
     for (dataset, method), row in summary.iterrows():
@@ -214,6 +281,12 @@ def plot_efficiency_curve(
         "LazyRF": "Lazy",
     }
     subset = df[df["dataset"].isin(target_datasets) & df["method"].isin(method_aliases.keys())]
+    if subset.empty:
+        print(
+            "[INFO] Skipping Figure 1 efficiency plot because required methods "
+            "(Full RF, Fixed Cascade, LazyRF) are not present in this run."
+        )
+        return
     agg = (
         subset.groupby(["dataset", "method"])["avg_work_units"]
         .mean()
@@ -315,8 +388,8 @@ def plot_lazygbm_tradeoffs(
     """
     Plot accuracy–efficiency trade-off curves for LazyGBM.
 
-    For each dataset with LazyGBM SPRT threshold sweeps, we aggregate accuracy
-    and average work across runs for each SPRT threshold and plot Accuracy vs
+    For each dataset with LazyGBM stability-threshold sweeps, we aggregate accuracy
+    and average work across runs for each threshold and plot Accuracy vs
     Avg Work (number of boosting stages), annotated by threshold.
     """
     subset = df[df["lazy_gbm_threshold"].notna()].copy()

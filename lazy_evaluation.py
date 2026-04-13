@@ -3,7 +3,7 @@ Lazy evaluation algorithms for tree ensembles.
 
 This module contains two estimators:
 * LazyRF  - Bayesian stopping for RandomForest classifiers.
-* LazyGBM - Residual-bounded / SPRT stopping for GradientBoostingClassifier.
+* LazyGBM - Residual-bounded stopping plus prototype margin heuristics for GradientBoostingClassifier.
 
 The implementations preserve the original research behavior while adding
 extensive documentation, validations, and type hints for maintainability.
@@ -94,8 +94,13 @@ class LazyRF(BaseEstimator, ClassifierMixin):
     """
     Lazy Random Forest inference.
 
-    Parameters mirror the original implementation. See predict_lazy for usage.
+    Stop checks are evaluated only at fixed block boundaries.
     """
+
+    STOP_REASON_LABELS = {
+        0: "posterior_threshold",
+        1: "full_evaluation",
+    }
 
     def __init__(
         self,
@@ -103,10 +108,8 @@ class LazyRF(BaseEstimator, ClassifierMixin):
         threshold: float = 0.95,
         min_trees: int = 10,
         block_size: int = 10,
-        fast_start_trees: Optional[int] = None,
         mc_samples: int = 256,
         random_state: Optional[int] = None,
-        hybrid_mode: bool = False,
     ) -> None:
         if not hasattr(base_estimator, "estimators_"):
             raise ValueError("Base estimator must be a fitted RandomForestClassifier.")
@@ -115,12 +118,8 @@ class LazyRF(BaseEstimator, ClassifierMixin):
         self.threshold = float(threshold)
         self.min_trees = int(min_trees)
         self.block_size = max(1, int(block_size))
-        self.fast_start_trees = (
-            int(fast_start_trees) if fast_start_trees is not None else self.min_trees
-        )
         self.mc_samples = int(mc_samples)
         self.rng = np.random.default_rng(random_state)
-        self.hybrid_mode = bool(hybrid_mode)
 
         self.n_classes_: int = base_estimator.n_classes_
         self.classes_: np.ndarray = base_estimator.classes_
@@ -216,14 +215,17 @@ class LazyRF(BaseEstimator, ClassifierMixin):
                 probs[approx_idx] = _approx_norm_cdf(z_scores)
         return probs
 
-    def predict_lazy(self, X: ArrayLike) -> Tuple[np.ndarray, float]:
-        """Return lazy predictions along with average evaluated trees."""
-        X = _ensure_2d(X)
+    def _predict_lazy_internal(
+        self, X: np.ndarray
+    ) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Core LazyRF inference loop returning per-sample diagnostics."""
         n_samples = X.shape[0]
         n_trees = len(self.estimators_)
         alphas = np.ones((n_samples, self.n_classes_), dtype=np.float64)
         final_preds = np.full(n_samples, -1, dtype=int)
         trees_used = np.zeros(n_samples, dtype=int)
+        stop_scores = np.full(n_samples, np.nan, dtype=np.float64)
+        stop_reasons = np.full(n_samples, -1, dtype=np.int8)
         active_mask = np.ones(n_samples, dtype=bool)
 
         def accumulate_block(start_idx: int, end_idx: int, sample_idx: np.ndarray) -> None:
@@ -249,47 +251,72 @@ class LazyRF(BaseEstimator, ClassifierMixin):
             if exiting.size:
                 final_preds[exiting] = best_idx[confident]
                 trees_used[exiting] = evaluated
+                stop_scores[exiting] = probs[confident]
+                stop_reasons[exiting] = 0
                 active_mask[exiting] = False
 
-        trees_evaluated = 0
-        hybrid_cutoff = 0
-        if self.hybrid_mode:
-            hybrid_cutoff = max(self.min_trees, n_trees // 2)
-            for tree in self.estimators_[:hybrid_cutoff]:
-                preds = tree.predict(X)
-                mapped = np.searchsorted(self.classes_, preds)
-                valid = mapped >= 0
-                if np.any(valid):
-                    np.add.at(alphas, (np.arange(n_samples)[valid], mapped[valid]), 1)
-            trees_evaluated = hybrid_cutoff
-            apply_stopping(np.arange(n_samples), trees_evaluated)
-
-        fast_start = max(hybrid_cutoff, min(self.fast_start_trees, n_trees))
-        if fast_start > hybrid_cutoff:
-            initial_idx = np.arange(n_samples)
-            accumulate_block(hybrid_cutoff, fast_start, initial_idx)
-            trees_evaluated = fast_start
-            apply_stopping(initial_idx, trees_evaluated)
-
-        for start in range(max(fast_start, trees_evaluated), n_trees, self.block_size):
+        for start in range(0, n_trees, self.block_size):
             end = min(start + self.block_size, n_trees)
             active_idx = np.where(active_mask)[0]
             if not active_idx.size:
                 break
             accumulate_block(start, end, active_idx)
-            trees_evaluated = end
-            apply_stopping(active_idx, trees_evaluated)
+            if end >= self.min_trees:
+                apply_stopping(active_idx, end)
 
         if np.any(active_mask):
             leftover = np.where(active_mask)[0]
             final_preds[leftover] = np.argmax(alphas[leftover], axis=1)
             trees_used[leftover] = n_trees
+            stop_reasons[leftover] = 1
 
-        return self.classes_[final_preds], float(np.mean(trees_used))
+        missing_score = np.isnan(stop_scores)
+        if np.any(missing_score):
+            missing_idx = np.where(missing_score)[0]
+            alphas_missing = alphas[missing_idx]
+            best_idx = np.argmax(alphas_missing, axis=1)
+            stop_scores[missing_idx] = self._sample_posterior_probs(alphas_missing, best_idx)
+
+        class_posteriors = alphas / np.sum(alphas, axis=1, keepdims=True)
+
+        return (
+            self.classes_[final_preds],
+            float(np.mean(trees_used)),
+            trees_used,
+            stop_scores,
+            stop_reasons,
+            class_posteriors,
+        )
+
+    def predict_lazy(self, X: ArrayLike) -> Tuple[np.ndarray, float]:
+        """Return lazy predictions along with average evaluated trees."""
+        X = _ensure_2d(X)
+        preds, avg_trees, _, _, _, _ = self._predict_lazy_internal(X)
+        return preds, avg_trees
+
+    def predict_lazy_with_details(self, X: ArrayLike) -> Tuple[np.ndarray, float, Dict[str, np.ndarray]]:
+        """Return lazy predictions + average work + per-sample stopping diagnostics."""
+        X = _ensure_2d(X)
+        preds, avg_trees, trees_used, stop_scores, stop_reasons, class_posteriors = self._predict_lazy_internal(X)
+        details = {
+            "trees_used": trees_used,
+            "stop_scores": stop_scores,
+            "stop_reasons": stop_reasons,
+            "class_posteriors": class_posteriors,
+        }
+        return preds, avg_trees, details
 
 
 class LazyGBM(BaseEstimator, ClassifierMixin):
     """Lazy evaluation for GradientBoostingClassifier."""
+
+    STOP_REASON_LABELS = {
+        0: "certificate",
+        1: "ratio_heuristic",
+        2: "flip_score",
+        3: "late_margin",
+        4: "full_evaluation",
+    }
 
     def __init__(
         self,
@@ -297,6 +324,12 @@ class LazyGBM(BaseEstimator, ClassifierMixin):
         spr_threshold: float = 4.6,
         min_trees: int = 10,
         block_size: int = 1,
+        enable_ratio_heuristic: bool = True,
+        ratio_threshold: float = 1.5,
+        enable_flip_heuristic: bool = True,
+        multiclass_flip_scale: float = 2.0,
+        enable_late_margin_fallback: bool = True,
+        late_margin_fraction: float = 0.8,
     ) -> None:
         if not hasattr(base_estimator, "estimators_"):
             raise ValueError("Base estimator must be a fitted GradientBoostingClassifier.")
@@ -305,6 +338,12 @@ class LazyGBM(BaseEstimator, ClassifierMixin):
         self.spr_threshold = spr_threshold
         self.min_trees = int(min_trees)
         self.block_size = max(1, int(block_size))
+        self.enable_ratio_heuristic = bool(enable_ratio_heuristic)
+        self.ratio_threshold = float(ratio_threshold)
+        self.enable_flip_heuristic = bool(enable_flip_heuristic)
+        self.multiclass_flip_scale = float(multiclass_flip_scale)
+        self.enable_late_margin_fallback = bool(enable_late_margin_fallback)
+        self.late_margin_fraction = float(late_margin_fraction)
 
         self.estimators_ = base_estimator.estimators_
         self.init_estimator = base_estimator.init_
@@ -362,8 +401,10 @@ class LazyGBM(BaseEstimator, ClassifierMixin):
                 raise ValueError(f"Unexpected init shape: {raw_pred.shape}")
         return raw_pred
 
-    def predict_lazy(self, X: ArrayLike) -> Tuple[np.ndarray, float]:
-        """Run lazy evaluation and return predictions + average depth."""
+    def _predict_lazy_internal(
+        self, X: np.ndarray
+    ) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+        """Core LazyGBM loop returning per-sample stopping diagnostics."""
         X = _ensure_2d(X)
         n_samples = X.shape[0]
         n_stages = self.estimators_.shape[0]
@@ -373,6 +414,9 @@ class LazyGBM(BaseEstimator, ClassifierMixin):
         trees_used = np.zeros(n_samples, dtype=int)
         active_mask = np.ones(n_samples, dtype=bool)
         final_preds = np.empty(n_samples, dtype=self.classes_.dtype)
+        stop_reasons = np.full(n_samples, -1, dtype=np.int8)
+        margins_at_stop = np.full(n_samples, np.nan, dtype=np.float64)
+        flip_scores = np.full(n_samples, np.nan, dtype=np.float64)
 
         if not is_multiclass:
             all_tree_preds = np.array([stage[0].predict(X) * self.learning_rate for stage in self.estimators_])
@@ -408,48 +452,67 @@ class LazyGBM(BaseEstimator, ClassifierMixin):
                 else:
                     margins = top1 - top2
                     unstoppable = margins > 2 * remaining_bound
+                reason_codes = np.full(len(active_indices), -1, dtype=np.int8)
                 final_mask = unstoppable.copy()
-                if remaining_bound > 0:
+                reason_codes[unstoppable] = 0
+                if self.enable_ratio_heuristic and remaining_bound > 0:
                     conf_ratio = margins / (2 * remaining_bound + 1e-9)
-                    final_mask |= conf_ratio > 1.5
-                if end >= self.min_trees:
+                    ratio_mask = (~final_mask) & (conf_ratio > self.ratio_threshold)
+                    final_mask |= ratio_mask
+                    reason_codes[ratio_mask] = 1
+                if end >= self.min_trees and self.enable_flip_heuristic:
                     unresolved = ~final_mask
                     if np.any(unresolved):
                         if remaining_range_sq > 0:
                             prob_flip = np.exp(-(margins[unresolved] ** 2) / (2 * (remaining_range_sq + 1e-12)))
-                            prob_stop = prob_flip < self.flip_prob_threshold * 2.0
+                            flip_scores[active_indices[unresolved]] = prob_flip
+                            prob_stop = prob_flip < self.flip_prob_threshold * self.multiclass_flip_scale
                             idx = np.where(unresolved)[0][prob_stop]
                             final_mask[idx] = True
+                            reason_codes[idx] = 2
                         else:
                             final_mask[unresolved] = True
-                if end > int(0.8 * n_stages):
-                    final_mask |= margins > 0
+                            reason_codes[unresolved] = 2
+                late_threshold = int(self.late_margin_fraction * n_stages)
+                if self.enable_late_margin_fallback and end > late_threshold:
+                    late_mask = (~final_mask) & (margins > 0)
+                    final_mask |= late_mask
+                    reason_codes[late_mask] = 3
                 newly_done = active_indices[final_mask]
                 if newly_done.size:
                     best = np.argmax(raw_predictions[newly_done], axis=1)
                     final_preds[newly_done] = self.classes_[best]
                     trees_used[newly_done] = end
+                    stop_reasons[newly_done] = reason_codes[final_mask]
+                    margins_at_stop[newly_done] = margins[final_mask]
                     active_mask[newly_done] = False
             else:
                 margins = raw_predictions[active_indices]
                 unstoppable_pos = margins - remaining_bound > 0
                 unstoppable_neg = margins + remaining_bound < 0
+                reason_codes = np.full(len(active_indices), -1, dtype=np.int8)
                 final_mask = unstoppable_pos | unstoppable_neg
-                if end >= self.min_trees:
+                reason_codes[final_mask] = 0
+                if end >= self.min_trees and self.enable_flip_heuristic:
                     unresolved = ~final_mask
                     if np.any(unresolved):
                         if remaining_range_sq > 0:
                             prob_flip = np.exp(-(np.abs(margins[unresolved]) ** 2) / (2 * (remaining_range_sq + 1e-12)))
+                            flip_scores[active_indices[unresolved]] = prob_flip
                             idx = np.where(unresolved)[0][prob_flip < self.flip_prob_threshold]
                             final_mask[idx] = True
+                            reason_codes[idx] = 2
                         else:
                             final_mask[unresolved] = True
+                            reason_codes[unresolved] = 2
                 newly_done = active_indices[final_mask]
                 if newly_done.size:
                     final_preds[newly_done] = np.where(
                         raw_predictions[newly_done] >= 0, self.classes_[1], self.classes_[0]
                     )
                     trees_used[newly_done] = end
+                    stop_reasons[newly_done] = reason_codes[final_mask]
+                    margins_at_stop[newly_done] = margins[final_mask]
                     active_mask[newly_done] = False
 
             if not np.any(active_mask):
@@ -460,10 +523,33 @@ class LazyGBM(BaseEstimator, ClassifierMixin):
             if is_multiclass:
                 best = np.argmax(raw_predictions[remaining], axis=1)
                 final_preds[remaining] = self.classes_[best]
+                partitioned = np.partition(raw_predictions[remaining], -2, axis=1)
+                margins_at_stop[remaining] = partitioned[:, -1] - partitioned[:, -2]
             else:
                 final_preds[remaining] = np.where(
                     raw_predictions[remaining] >= 0, self.classes_[1], self.classes_[0]
                 )
+                margins_at_stop[remaining] = raw_predictions[remaining]
             trees_used[remaining] = n_stages
+            stop_reasons[remaining] = 4
 
-        return final_preds, float(np.mean(trees_used))
+        return final_preds, float(np.mean(trees_used)), trees_used, stop_reasons, {
+            "margins_at_stop": margins_at_stop,
+            "flip_scores": flip_scores,
+        }
+
+    def predict_lazy(self, X: ArrayLike) -> Tuple[np.ndarray, float]:
+        """Run lazy evaluation and return predictions + average depth."""
+        preds, avg_trees, _, _, _ = self._predict_lazy_internal(_ensure_2d(X))
+        return preds, avg_trees
+
+    def predict_lazy_with_details(self, X: ArrayLike) -> Tuple[np.ndarray, float, Dict[str, np.ndarray]]:
+        """Return lazy predictions + average depth + per-sample stopping diagnostics."""
+        preds, avg_trees, trees_used, stop_reasons, aux = self._predict_lazy_internal(_ensure_2d(X))
+        details = {
+            "trees_used": trees_used,
+            "stop_reasons": stop_reasons,
+            "margins_at_stop": aux["margins_at_stop"],
+            "flip_scores": aux["flip_scores"],
+        }
+        return preds, avg_trees, details

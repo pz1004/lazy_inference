@@ -1,205 +1,231 @@
 # Instance-Adaptive Lazy Inference for Tree Ensembles
 
-This repository provides inference-time wrappers for pre-trained tree ensembles (Random Forests and Gradient Boosted Decision Trees) that adaptively stop evaluation early when the prediction is sufficiently stable, reducing computational cost without modifying the trained model.
+This repository contains inference-time wrappers and experiment scripts for adaptive early stopping in tree ensembles. The current codebase is centered on two model-preserving wrappers for fitted scikit-learn classifiers:
 
-## Overview
+- `LazyRF` wraps `RandomForestClassifier` and stops at fixed block boundaries when a posterior stability score is high enough.
+- `LazyGBM` wraps `GradientBoostingClassifier` and combines residual-capacity certificates with optional heuristic stopping rules.
 
-Tree ensembles evaluate all components for every input, incurring fixed computational costs regardless of instance difficulty. However, many inputs are "easy" and can be classified reliably after evaluating only a fraction of the ensemble.
+The repo also includes comparison baselines, multi-seed experiment runners, plotting utilities, analysis scripts, and bundled CSV snapshots from prior runs.
 
-This implementation provides two lazy inference wrappers:
+## What Is In The Repo?
 
-- **LazyRF**: For Random Forests - uses a Bayesian posterior predictive model to determine when the majority vote is unlikely to change
-- **LazyGBM**: For Gradient Boosting - uses residual-capacity certificates and concentration-inspired bounds for early stopping
+- `lazy_evaluation.py`: `LazyRF` and `LazyGBM`, plus per-sample stopping diagnostics.
+- `baselines.py`: full RF, fixed cascade, two-stage cascade, QuickScorer, and BranchyNet baselines.
+- `run_experiments.py`: single-run experiment harness.
+- `run_multi_experiments.py`: repeated-run harness with aggregate statistics, plots, and optional LaTeX output.
+- `table_figures.py`: publication-style tables and 2x2 figures from `raw_results_perf.csv` and `raw_results_sweep.csv`.
+- `analysis/`: LazyRF calibration, sanity checks, and table-building utilities.
+- `rerun_all_tables.sh`: end-to-end 30-seed regeneration pipeline for tables, figures, ablations, and calibration outputs.
 
-### Key Features
-
-- **Model-preserving**: Works as inference-time wrappers around pre-trained scikit-learn models
-- **Instance-adaptive**: Stops early on easy inputs, uses full evaluation for hard inputs
-- **Worst-case guarantee**: Always bounded by full model evaluation
-- **Configurable trade-offs**: Adjustable thresholds to control accuracy-efficiency trade-off
-
-## Methods
-
-### LazyRF (Lazy Random Forest)
-
-LazyRF models the remaining forest votes using a Dirichlet-multinomial posterior predictive distribution and computes a stability surrogate that estimates the probability that the current leading class remains the final argmax.
-
-**Key parameters:**
-- `threshold` (α_stop): Confidence threshold for early stopping (default: 0.95)
-- `min_trees`: Minimum trees to evaluate before checking stopping condition (default: 10)
-- `block_size`: Number of trees to evaluate between stopping checks (default: 10)
-
-### LazyGBM (Lazy Gradient Boosting)
-
-LazyGBM exploits the additive structure of boosting to derive stopping conditions:
-
-1. **Lossless mode**: Uses a deterministic residual-capacity certificate - stops when the current margin cannot be overturned by remaining stages
-2. **Near-lossless mode**: Uses a concentration-inspired stability score for tunable early stopping
-
-**Key parameters:**
-- `spr_threshold` (γ): Stability threshold for near-lossless stopping (default: 3.0)
-- `min_trees`: Minimum stages before checking stopping condition (default: 10)
+This is a script-first research repo rather than an installable Python package. Run commands from the repository root.
 
 ## Installation
 
+There is no `requirements.txt` or package metadata in the repo right now, so install dependencies manually.
+
 ```bash
-# Clone the repository
 git clone https://github.com/pz1004/lazy_inference.git
 cd lazy_inference
-
-# Install dependencies
-pip install numpy scipy scikit-learn torch torchvision pandas
-# Optional: pip install numba  # For JIT-accelerated computations
 ```
 
-## Usage
+Minimal dependencies for the lazy wrappers:
 
-### Basic Usage
+```bash
+pip install numpy scipy scikit-learn
+```
+
+Full experiment and plotting stack:
+
+```bash
+pip install numpy scipy pandas scikit-learn matplotlib torch torchvision
+# optional, used automatically when available
+pip install numba
+```
+
+Notes:
+
+- `torch` and `torchvision` are needed for the BranchyNet baseline and MNIST loading.
+- `matplotlib` and `pandas` are needed for `run_multi_experiments.py`, `table_figures.py`, and the analysis scripts.
+- `numba` is optional. The wrappers fall back to pure NumPy if it is not installed.
+
+## Quick Start
 
 ```python
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from lazy_evaluation import LazyRF, LazyGBM
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 
-# Train a standard Random Forest
-rf = RandomForestClassifier(n_estimators=100, random_state=42)
-rf.fit(X_train, y_train)
+from lazy_evaluation import LazyGBM, LazyRF
 
-# Wrap with LazyRF for efficient inference
-lazy_rf = LazyRF(rf, threshold=0.95, min_trees=10)
-predictions, avg_trees_used = lazy_rf.predict_lazy(X_test)
-print(f"Average trees evaluated: {avg_trees_used:.1f} / 100")
+rf = RandomForestClassifier(n_estimators=100, random_state=42).fit(X_train, y_train)
+lazy_rf = LazyRF(
+    rf,
+    threshold=0.95,
+    min_trees=10,
+    block_size=10,
+    random_state=42,
+)
+y_pred_rf, avg_trees, rf_details = lazy_rf.predict_lazy_with_details(X_test)
 
-# Train a standard Gradient Boosting Classifier
-gbm = GradientBoostingClassifier(n_estimators=100, random_state=42)
-gbm.fit(X_train, y_train)
-
-# Wrap with LazyGBM for efficient inference
-lazy_gbm = LazyGBM(gbm, spr_threshold=3.0, min_trees=10)
-predictions, avg_stages_used = lazy_gbm.predict_lazy(X_test)
-print(f"Average stages evaluated: {avg_stages_used:.1f} / 100")
+gbm = GradientBoostingClassifier(n_estimators=100, random_state=42).fit(X_train, y_train)
+lazy_gbm = LazyGBM(
+    gbm,
+    spr_threshold=3.0,
+    min_trees=10,
+    block_size=1,
+    enable_ratio_heuristic=True,
+    enable_flip_heuristic=True,
+    enable_late_margin_fallback=True,
+)
+y_pred_gbm, avg_stages, gbm_details = lazy_gbm.predict_lazy_with_details(X_test)
 ```
 
-### Running Experiments
+Returned diagnostics:
 
-```bash
-# Run experiments on all datasets
-python run_experiments.py
+- `LazyRF`: `trees_used`, `stop_scores`, `stop_reasons`, `class_posteriors`
+- `LazyGBM`: `trees_used`, `stop_reasons`, `margins_at_stop`, `flip_scores`
 
-# Run on specific datasets
-python run_experiments.py --datasets mnist covertype
-
-# Run specific methods only
-python run_experiments.py --methods lazy_rf lazy_gbm full_rf full_gbm
-
-# Threshold sweep for LazyRF
-python run_experiments.py --lazy-rf-thresholds 0.90 0.95 0.97 0.99
-
-# Threshold sweep for LazyGBM
-python run_experiments.py --lazy-gbm-thresholds 2.0 3.0 4.0
-
-# Save results to JSON
-python run_experiments.py --output-json results/experiment_results.json
-```
-
-### Multi-seed Experiments
-
-```bash
-# Run experiments across multiple random seeds
-python run_multi_experiments.py --seeds 30 --output-json results/multi_seed_results.json
-```
+Important detail: the `LazyGBM` class constructor currently defaults to `spr_threshold=4.6`, while `run_experiments.py` defaults to `--lazy-gbm-threshold 3.0`. Pass the threshold explicitly if you want script and direct-library behavior to match.
 
 ## Datasets
 
-The experiments use four benchmark classification datasets:
+The experiment harness supports four datasets:
 
-| Dataset | Type | Classes | Features | Instances | Difficulty |
-|---------|------|---------|----------|-----------|------------|
-| MNIST | Image | 10 | 784 | 70,000 | Low (easy digits exit early) |
-| Covertype | Tabular | 7 | 54 | 581,000 | Medium (complex boundaries) |
-| Higgs | Physics | 2 | 28 | 11,000,000 | High (noise, requires depth) |
-| Credit Card | Anomaly | 2 | 30 | 284,000 | Variable (fraud is hard, normal is easy) |
+| CLI name | Dataset | Loader | Default location / behavior |
+| --- | --- | --- | --- |
+| `mnist` | MNIST | `torchvision.datasets.MNIST` | Auto-downloads into `data/mnist` |
+| `covertype` | Covertype | `sklearn.datasets.fetch_covtype` | Cached under `--data-dir` |
+| `higgs` | Higgs | Local CSV | Default `data/higgs/HIGGS.csv` or `HIGGS_PATH` |
+| `credit` | Credit Card Fraud | Local CSV | Default `data/creditcard/creditcard.csv` or `CREDIT_CARD_PATH` |
 
-Dataset paths can be configured via command-line arguments or environment variables:
-- `--higgs-path` or `HIGGS_PATH`
-- `--credit-path` or `CREDIT_CARD_PATH`
+Default row limits in the current scripts:
 
-## Results Summary
+- `--covertype-max-rows 200000`
+- `--higgs-max-rows 200000`
+- `--credit-max-rows 200000`
+- `--mnist-max-rows` defaults to no cap
 
-### LazyRF Performance
+If Higgs or Credit Card files are missing, `run_experiments.py` logs an error and skips that dataset instead of aborting the entire run.
 
-LazyRF achieves substantial work reductions while maintaining accuracy close to the full Random Forest:
+## Methods
 
-| Dataset | Full RF Accuracy | LazyRF Accuracy | Avg. Trees Used | Work Reduction |
-|---------|------------------|-----------------|-----------------|----------------|
-| Covertype | 0.9271 | 0.9267 | 19.16 | 81% |
-| Credit Card | 0.9995 | 0.9995 | 10.02 | 90% |
-| Higgs | 0.7218 | 0.7205 | 39.60 | 60% |
-| MNIST | 0.9695 | 0.9694 | 17.50 | 83% |
+`run_experiments.py --methods ...` accepts the following identifiers:
 
-### LazyGBM Performance
+| CLI identifier | Reported method name(s) | Notes |
+| --- | --- | --- |
+| `full_rf` | `Baseline A - Full RF` | Standard `RandomForestClassifier` baseline |
+| `fixed_cascade` | `Baseline B - Fixed Cascade` | Static RF checkpoint policy |
+| `cascade` | `Cascade RF (Two-Stage)` | Small RF first stage plus full RF fallback |
+| `lazy_rf` | `LazyRF` or parameterized `LazyRF[...]` names | Threshold, block-size, and `min_trees` sweeps |
+| `quickscorer` | `Baseline C - QuickScorer` | Bitmask-style tree traversal baseline |
+| `branchynet` | `Baseline D - Full BranchyNet` and `Baseline D - Early Exit BranchyNet` | Simple 3-block MLP baseline |
+| `full_gbm` | `Full GBM` | Standard `GradientBoostingClassifier` baseline |
+| `lazy_gbm` | `LazyGBM` or parameterized `LazyGBM[...]` names | Threshold and variant sweeps |
 
-LazyGBM provides more modest, dataset-dependent reductions:
+## Running Experiments
 
-| Dataset | Full GBM Accuracy | LazyGBM Accuracy | Avg. Stages Used | Work Reduction |
-|---------|-------------------|------------------|------------------|----------------|
-| Covertype | 0.7721 | 0.7672 | 81.00 | 19% |
-| Credit Card | 0.9987 | 0.9987 | 31.67 | 68% |
-| Higgs | 0.7120 | 0.7120 | 80.29 | 20% |
-| MNIST | 0.9459 | 0.9419 | 81.00 | 19% |
+Common single-run commands:
 
-## Project Structure
+```bash
+# all configured datasets and methods
+python run_experiments.py
 
+# only selected datasets and methods
+python run_experiments.py \
+  --datasets mnist covertype \
+  --methods full_rf lazy_rf full_gbm lazy_gbm
+
+# datasets backed by local CSVs
+python run_experiments.py \
+  --datasets higgs credit \
+  --higgs-path /path/to/HIGGS.csv \
+  --credit-path /path/to/creditcard.csv
+
+# LazyRF threshold sweep
+python run_experiments.py \
+  --methods lazy_rf \
+  --lazy-rf-thresholds 0.90 0.95 0.97 0.99 \
+  --output-json results/lazy_rf_sweep.json
+
+# LazyGBM threshold + variant sweep
+python run_experiments.py \
+  --methods full_gbm lazy_gbm \
+  --lazy-gbm-variant certificate_only \
+  --lazy-gbm-thresholds 2.0 3.0 4.0 \
+  --output-json results/lazy_gbm_ablation.json
 ```
-lazy_inference/
-├── lazy_evaluation.py      # Core LazyRF and LazyGBM implementations
-├── baselines.py            # Baseline methods (cascades, QuickScorer, BranchyNet)
-├── run_experiments.py      # Single-seed experiment runner
-├── run_multi_experiments.py # Multi-seed experiment runner
-├── table_figures.py        # Result visualization utilities
-└── README.md
+
+High-value CLI flags:
+
+- `--rf-trees`, `--gbm-trees`
+- `--fixed-checkpoints`, `--fixed-thresholds`
+- `--cascade-stage1`, `--cascade-threshold`
+- `--lazy-rf-threshold`, `--lazy-rf-min-trees`, `--lazy-rf-block-size`, `--lazy-rf-thresholds`
+- `--lazy-gbm-threshold`, `--lazy-gbm-min-trees`, `--lazy-gbm-block-size`
+- `--lazy-gbm-variant`, `--lazy-gbm-ratio-threshold`, `--lazy-gbm-flip-scale`, `--lazy-gbm-late-margin-fraction`
+- `--max-train-samples`, `--max-test-samples`
+- `--output-json`
+
+Use `python run_experiments.py -h` for the full CLI surface.
+
+The single-run script prints a per-dataset summary table to stdout and can optionally write a nested JSON report via `--output-json`.
+
+## Multi-Run Experiments
+
+`run_multi_experiments.py` extends the single-run harness with repeated seeds, aggregate statistics, plots, and optional LaTeX export:
+
+```bash
+python run_multi_experiments.py \
+  --runs 30 \
+  --datasets mnist covertype higgs credit \
+  --result-dir results/multi \
+  --no-display
 ```
 
-## Baselines
+Outputs under `--result-dir`:
 
-The repository includes several baseline methods for comparison:
+- `raw_results.csv`
+- `raw_results.json`
+- `figure1_efficiency_curve.png`
+- `lazy_rf_tradeoff_<dataset>.png`
+- `lazy_gbm_tradeoff_<dataset>.png`
+- optional LaTeX table via `--table-path`
 
-- **Full RF/GBM**: Standard full-ensemble evaluation
-- **Fixed Cascade**: Static checkpoint-based early exit
-- **Two-Stage Cascade**: Two-stage RF with confidence-based routing
-- **QuickScorer**: Bitmask-based tree traversal (constant-factor speedup)
-- **BranchyNet**: Early-exit neural network baseline
+Fresh `raw_results.csv` files produced by the current harness can include richer metadata than the bundled snapshot CSVs, including disagreement rate, AUROC/AUPRC on binary tasks, work quantiles, and stop-reason fractions when present.
 
-## Configuration Options
+## Bundled Result Snapshots
 
-### run_experiments.py
+The repository currently ships two consolidated CSV exports:
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--datasets` | all | Datasets to evaluate |
-| `--methods` | all | Methods to run |
-| `--rf-trees` | 100 | Number of trees in Random Forest |
-| `--gbm-trees` | 100 | Number of stages in GBM |
-| `--lazy-rf-threshold` | 0.95 | LazyRF confidence threshold |
-| `--lazy-rf-min-trees` | 10 | Minimum trees before LazyRF can stop |
-| `--lazy-gbm-threshold` | 3.0 | LazyGBM stability threshold |
-| `--lazy-gbm-min-trees` | 10 | Minimum stages before LazyGBM can stop |
-| `--random-state` | 42 | Random seed |
-| `--output-json` | None | Path to save JSON results |
+- `raw_results_perf.csv`: main benchmark snapshot with 1080 rows (`4 datasets x 9 reported methods x 30 runs`)
+- `raw_results_sweep.csv`: LazyRF and LazyGBM sweep snapshot with 600 rows
 
-## Notes
+From the bundled `raw_results_perf.csv`, the default lazy methods have the following mean work reductions:
 
-- **Work units** are an implementation-agnostic proxy for computational cost (trees for RF, stages for GBM). Wall-clock speedups may vary based on implementation details.
-- LazyRF's stability surrogate uses a Gaussian approximation to the Dirichlet-multinomial tails - it should be interpreted as a practical stopping statistic rather than a guaranteed probability bound.
-- LazyGBM's near-lossless mode uses an auxiliary-model assumption; the threshold should be interpreted as an aggressiveness knob rather than a calibrated probability.
+- `LazyRF`: Covertype `80.8%`, Credit Card `90.0%`, Higgs `60.4%`, MNIST `82.5%`
+- `LazyGBM`: Covertype `19.0%`, Credit Card `68.3%`, Higgs `19.7%`, MNIST `19.0%`
 
-## License
+See the CSVs for the full per-run accuracy, runtime, and threshold data.
 
-This project is provided for research and educational purposes.
+## Plotting And Analysis
 
-## Acknowledgments
+Useful repo scripts beyond the main experiment runners:
 
-This implementation uses:
-- [scikit-learn](https://scikit-learn.org/) for base ensemble models
-- [PyTorch](https://pytorch.org/) for neural network baselines
-- [NumPy](https://numpy.org/) and [SciPy](https://scipy.org/) for numerical computations
-- Optional [Numba](https://numba.pydata.org/) for JIT acceleration
+- `python table_figures.py`
+  Reads `raw_results_perf.csv` and `raw_results_sweep.csv` from the current directory and writes LaTeX tables to `tables/` plus PDF/PNG figures to `figures/`.
+- `python analysis/check_lazyrf_algorithm1.py`
+  Runs semantic checks for block-boundary LazyRF behavior.
+- `python analysis/calibrate_lazyrf.py --dataset covertype --runs 30 ...`
+  Measures whether `1 - stop_score` tracks disagreement with the full RF; writes calibration CSVs and `lazyrf_calibration_<dataset>.png`.
+- `python analysis/build_revision_tables.py --main-csv ...`
+  Builds revision-specific summary tables from refreshed raw outputs and ablations.
+- `bash rerun_all_tables.sh`
+  Orchestrates the full 30-seed pipeline, ablations, calibration runs, and downstream table generation.
+
+`rerun_all_tables.sh` writes to `results/full_tables_runs30_<timestamp>` and `logs/full_tables_runs30_<timestamp>` by default. You can override those roots with the `ROOT` and `LOG` environment variables.
+
+## Caveats
+
+- Work units are proxy metrics: RF trees, GBM stages, or BranchyNet depth. They are not guaranteed wall-clock speedups.
+- `LazyRF` stop checks happen only at block boundaries.
+- `LazyGBM` in this repo targets scikit-learn `GradientBoostingClassifier`; it is not a generic wrapper for every boosting library.
+- `QuickScorer` here is a research baseline implementation with fallback tracking, not a production-optimized systems implementation.
+- Experiment logging defaults to `logs/run_experiments.log` and can be overridden with `RUN_EXPERIMENTS_LOG` and `RUN_EXPERIMENTS_LOG_LEVEL`.

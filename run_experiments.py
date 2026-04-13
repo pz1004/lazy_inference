@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 from sklearn.datasets import fetch_covtype
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from torchvision.datasets import MNIST
@@ -337,10 +337,67 @@ def energy_proxy(result: BaselineResult) -> float:
     return max(result.avg_work_units, 1e-9)
 
 
+def _work_quantile_summary(work_units: np.ndarray) -> Dict[str, float]:
+    quantiles = {
+        "work_p50": 0.50,
+        "work_p90": 0.90,
+        "work_p95": 0.95,
+        "work_p99": 0.99,
+    }
+    return {
+        name: float(np.quantile(work_units, quantile))
+        for name, quantile in quantiles.items()
+    }
+
+
+def _stop_reason_summary(stop_reasons: np.ndarray, labels: Dict[int, str]) -> Dict[str, float]:
+    n = max(len(stop_reasons), 1)
+    summary: Dict[str, float] = {}
+    for code, label in labels.items():
+        summary[f"stop_{label}_fraction"] = float(np.sum(stop_reasons == code) / n)
+    return summary
+
+
+def _lazy_gbm_variant_config(args: argparse.Namespace) -> Dict[str, Any]:
+    variant = getattr(args, "lazy_gbm_variant", "current")
+    base = {
+        "block_size": args.lazy_gbm_block_size,
+        "ratio_threshold": args.lazy_gbm_ratio_threshold,
+        "multiclass_flip_scale": args.lazy_gbm_flip_scale,
+        "late_margin_fraction": args.lazy_gbm_late_margin_fraction,
+    }
+    if variant == "current":
+        return {
+            **base,
+            "variant": variant,
+            "enable_ratio_heuristic": True,
+            "enable_flip_heuristic": True,
+            "enable_late_margin_fallback": True,
+        }
+    if variant == "certificate_only":
+        return {
+            **base,
+            "variant": variant,
+            "enable_ratio_heuristic": False,
+            "enable_flip_heuristic": False,
+            "enable_late_margin_fallback": False,
+        }
+    if variant == "certificate_plus_flip":
+        return {
+            **base,
+            "variant": variant,
+            "enable_ratio_heuristic": False,
+            "enable_flip_heuristic": True,
+            "enable_late_margin_fallback": False,
+        }
+    raise ValueError(f"Unsupported LazyGBM variant: {variant}")
+
+
 def summarize_metrics(reference: BaselineResult, candidate: BaselineResult) -> Dict[str, float]:
     speedup = reference.inference_time / candidate.inference_time if candidate.inference_time > 0 else float("inf")
     accuracy_drop = reference.accuracy - candidate.accuracy
     worst_case_latency = reference.inference_time
+    disagreement_rate = float(np.mean(reference.predictions != candidate.predictions))
     base_energy = energy_proxy(reference)
     candidate_energy = energy_proxy(candidate)
     energy_reduction = 1.0 - (candidate_energy / base_energy) if base_energy > 0 else 0.0
@@ -348,11 +405,40 @@ def summarize_metrics(reference: BaselineResult, candidate: BaselineResult) -> D
         "speedup": speedup,
         "accuracy_drop": accuracy_drop,
         "worst_case_latency": worst_case_latency,
+        "disagreement_rate": disagreement_rate,
         "energy_reduction": energy_reduction,
+        "work_reduction": energy_reduction,
     }
 
 
-def baseline_summary(result: BaselineResult, metrics: Dict[str, float]) -> Dict[str, Any]:
+def _binary_score_metrics(y_test: Optional[np.ndarray], result: BaselineResult) -> Dict[str, float]:
+    if y_test is None or result.scores is None:
+        return {}
+    y = np.asarray(y_test)
+    scores = np.asarray(result.scores, dtype=np.float64)
+    if y.shape[0] != scores.shape[0] or np.unique(y).size != 2:
+        return {}
+    finite = np.isfinite(scores)
+    if not np.all(finite):
+        y = y[finite]
+        scores = scores[finite]
+    if y.size == 0 or np.unique(y).size != 2:
+        return {}
+    try:
+        return {
+            "auroc": float(roc_auc_score(y, scores)),
+            "auprc": float(average_precision_score(y, scores)),
+        }
+    except ValueError:
+        return {}
+
+
+def baseline_summary(
+    result: BaselineResult,
+    metrics: Dict[str, float],
+    y_test: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    metrics = {**metrics, **_binary_score_metrics(y_test, result)}
     return {
         "name": result.name,
         "accuracy": result.accuracy,
@@ -375,6 +461,7 @@ def train_full_gbm(
     preds = gbm.predict(X_test)
     inf_time = time.time() - inf_start
     acc = accuracy_score(y_test, preds)
+    scores = gbm.predict_proba(X_test)[:, 1] if len(gbm.classes_) == 2 else None
     return BaselineResult(
         name="Full GBM",
         accuracy=acc,
@@ -383,6 +470,7 @@ def train_full_gbm(
         predictions=preds,
         model=gbm,
         metadata={"train_time": train_time},
+        scores=scores,
     )
 
 
@@ -392,16 +480,34 @@ def evaluate_lazy_rf(
     y_test: np.ndarray,
     threshold: float,
     min_trees: int,
+    block_size: int,
+    random_state: Optional[int] = None,
     name: str = "LazyRF",
 ) -> BaselineResult:
-    """Evaluate LazyRF at a given posterior threshold."""
-    lazy_rf = LazyRF(rf_result.model, threshold=threshold, min_trees=min_trees)
+    """Evaluate LazyRF on a fixed block-boundary checkpoint grid."""
+    lazy_rf = LazyRF(
+        rf_result.model,
+        threshold=threshold,
+        min_trees=min_trees,
+        block_size=block_size,
+        random_state=random_state,
+    )
     # Warm-up to avoid one-off timing overhead
     _ = lazy_rf.predict_lazy(X_test[: min(100, len(X_test))])
     start_time = time.time()
-    preds, avg_trees = lazy_rf.predict_lazy(X_test)
+    preds, avg_trees, details = lazy_rf.predict_lazy_with_details(X_test)
     inf_time = time.time() - start_time
     acc = accuracy_score(y_test, preds)
+    scores = details["class_posteriors"][:, 1] if details["class_posteriors"].shape[1] == 2 else None
+    metadata = {
+        "threshold": threshold,
+        "min_trees": min_trees,
+        "block_size": block_size,
+        "mean_stop_score": float(np.mean(details["stop_scores"])),
+        "median_stop_score": float(np.median(details["stop_scores"])),
+        **_work_quantile_summary(details["trees_used"]),
+        **_stop_reason_summary(details["stop_reasons"], LazyRF.STOP_REASON_LABELS),
+    }
     return BaselineResult(
         name=name,
         accuracy=acc,
@@ -409,7 +515,8 @@ def evaluate_lazy_rf(
         avg_work_units=avg_trees,
         predictions=preds,
         model=lazy_rf,
-        metadata={"threshold": threshold, "min_trees": min_trees},
+        metadata=metadata,
+        scores=scores,
     )
 
 
@@ -419,16 +526,53 @@ def evaluate_lazy_gbm(
     y_test: np.ndarray,
     spr_threshold: float,
     min_trees: int,
+    variant_config: Dict[str, Any],
     name: str = "LazyGBM",
 ) -> BaselineResult:
-    """Evaluate LazyGBM at a given SPRT threshold."""
-    lazy_gbm = LazyGBM(gbm_result.model, spr_threshold=spr_threshold, min_trees=min_trees)
+    """Evaluate LazyGBM at a given stability/flip-score threshold."""
+    lazy_gbm = LazyGBM(
+        gbm_result.model,
+        spr_threshold=spr_threshold,
+        min_trees=min_trees,
+        block_size=variant_config["block_size"],
+        enable_ratio_heuristic=variant_config["enable_ratio_heuristic"],
+        ratio_threshold=variant_config["ratio_threshold"],
+        enable_flip_heuristic=variant_config["enable_flip_heuristic"],
+        multiclass_flip_scale=variant_config["multiclass_flip_scale"],
+        enable_late_margin_fallback=variant_config["enable_late_margin_fallback"],
+        late_margin_fraction=variant_config["late_margin_fraction"],
+    )
     # Warm-up
     _ = lazy_gbm.predict_lazy(X_test[: min(100, len(X_test))])
     start_time = time.time()
-    preds, avg_trees = lazy_gbm.predict_lazy(X_test)
+    preds, avg_trees, details = lazy_gbm.predict_lazy_with_details(X_test)
     inf_time = time.time() - start_time
     acc = accuracy_score(y_test, preds)
+    margins = details["margins_at_stop"]
+    scores = None
+    if len(gbm_result.model.classes_) == 2:
+        clipped_margins = np.clip(margins, -709.0, 709.0)
+        scores = 1.0 / (1.0 + np.exp(-clipped_margins))
+    finite_flip_scores = details["flip_scores"][np.isfinite(details["flip_scores"])]
+    metadata = {
+        "spr_threshold": spr_threshold,
+        "min_trees": min_trees,
+        "block_size": variant_config["block_size"],
+        "variant": variant_config["variant"],
+        "enable_ratio_heuristic": variant_config["enable_ratio_heuristic"],
+        "ratio_threshold": variant_config["ratio_threshold"],
+        "enable_flip_heuristic": variant_config["enable_flip_heuristic"],
+        "multiclass_flip_scale": variant_config["multiclass_flip_scale"],
+        "enable_late_margin_fallback": variant_config["enable_late_margin_fallback"],
+        "late_margin_fraction": variant_config["late_margin_fraction"],
+        "mean_abs_margin_at_stop": float(np.mean(np.abs(margins))),
+        "median_abs_margin_at_stop": float(np.median(np.abs(margins))),
+        "mean_flip_score": (
+            float(np.mean(finite_flip_scores)) if finite_flip_scores.size else float("nan")
+        ),
+        **_work_quantile_summary(details["trees_used"]),
+        **_stop_reason_summary(details["stop_reasons"], LazyGBM.STOP_REASON_LABELS),
+    }
     return BaselineResult(
         name=name,
         accuracy=acc,
@@ -436,7 +580,8 @@ def evaluate_lazy_gbm(
         avg_work_units=avg_trees,
         predictions=preds,
         model=lazy_gbm,
-        metadata={"spr_threshold": spr_threshold, "min_trees": min_trees},
+        metadata=metadata,
+        scores=scores,
     )
 
 
@@ -520,7 +665,14 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
             results.append(
                 baseline_summary(
                     rf_full,
-                    {"speedup": 1.0, "accuracy_drop": 0.0, "worst_case_latency": rf_full.inference_time, "energy_reduction": 0.0},
+                    {
+                        "speedup": 1.0,
+                        "accuracy_drop": 0.0,
+                        "worst_case_latency": rf_full.inference_time,
+                        "energy_reduction": 0.0,
+                        "work_reduction": 0.0,
+                    },
+                    y_test=y_test,
                 )
             )
             LOGGER.info("[%s] Baseline A acc=%.4f time=%.4fs", spec.name, rf_full.accuracy, rf_full.inference_time)
@@ -528,7 +680,7 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
         if should_run("fixed_cascade"):
             checkpoints, thresholds = _build_fixed_cascade_config(args)
             fixed_baseline = run_fixed_cascade_baseline(rf_full.model, X_test, y_test, checkpoints, thresholds)
-            results.append(baseline_summary(fixed_baseline, summarize_metrics(rf_full, fixed_baseline)))
+            results.append(baseline_summary(fixed_baseline, summarize_metrics(rf_full, fixed_baseline), y_test=y_test))
             LOGGER.info(
                 "[%s] Baseline B acc=%.4f avg_trees=%.1f checkpoints=%s",
                 spec.name,
@@ -548,7 +700,7 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
                 threshold=args.cascade_threshold,
                 random_state=args.random_state,
             )
-            results.append(baseline_summary(cascade, summarize_metrics(rf_full, cascade)))
+            results.append(baseline_summary(cascade, summarize_metrics(rf_full, cascade), y_test=y_test))
             LOGGER.info(
                 "[%s] Cascade RF acc=%.4f hard_fraction=%.2f",
                 spec.name,
@@ -564,16 +716,28 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
                 rf_thresholds = [float(args.lazy_rf_threshold)]
 
             for thr in rf_thresholds:
-                name = "LazyRF" if len(rf_thresholds) == 1 else f"LazyRF[t={thr:.3f}]"
+                is_default_lazy_rf = (
+                    len(rf_thresholds) == 1
+                    and args.lazy_rf_block_size == 10
+                    and args.lazy_rf_min_trees == 10
+                )
+                if is_default_lazy_rf:
+                    name = "LazyRF"
+                else:
+                    name = (
+                        f"LazyRF[t={thr:.3f},B={args.lazy_rf_block_size},m={args.lazy_rf_min_trees}]"
+                    )
                 lazy_rf_result = evaluate_lazy_rf(
                     rf_full,
                     X_test,
                     y_test,
                     threshold=thr,
                     min_trees=args.lazy_rf_min_trees,
+                    block_size=args.lazy_rf_block_size,
+                    random_state=args.random_state,
                     name=name,
                 )
-                results.append(baseline_summary(lazy_rf_result, summarize_metrics(rf_full, lazy_rf_result)))
+                results.append(baseline_summary(lazy_rf_result, summarize_metrics(rf_full, lazy_rf_result), y_test=y_test))
                 LOGGER.info(
                     "[%s] %s acc=%.4f avg_trees=%.1f threshold=%.3f",
                     spec.name,
@@ -586,7 +750,7 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
         # --- QuickScorer ---
         if should_run("quickscorer"):
             quickscorer = run_quickscorer_baseline(rf_full.model, X_test, y_test)
-            results.append(baseline_summary(quickscorer, summarize_metrics(rf_full, quickscorer)))
+            results.append(baseline_summary(quickscorer, summarize_metrics(rf_full, quickscorer), y_test=y_test))
             LOGGER.info(
                 "[%s] QuickScorer acc=%.4f time=%.4fs fallback=%.4f",
                 spec.name,
@@ -616,10 +780,17 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
         results.append(
             baseline_summary(
                 full_nn,
-                {"speedup": 1.0, "accuracy_drop": 0.0, "worst_case_latency": full_nn.inference_time, "energy_reduction": 0.0},
+                {
+                    "speedup": 1.0,
+                    "accuracy_drop": 0.0,
+                    "worst_case_latency": full_nn.inference_time,
+                    "energy_reduction": 0.0,
+                    "work_reduction": 0.0,
+                },
+                y_test=y_test,
             )
         )
-        results.append(baseline_summary(lazy_nn, summarize_metrics(full_nn, lazy_nn)))
+        results.append(baseline_summary(lazy_nn, summarize_metrics(full_nn, lazy_nn), y_test=y_test))
         LOGGER.info(
             "[%s] BranchyNet lazy acc=%.4f avg_depth=%.2f",
             spec.name,
@@ -643,32 +814,39 @@ def run_single_dataset(spec: DatasetSpec, args: argparse.Namespace) -> Dict[str,
                         "accuracy_drop": 0.0,
                         "worst_case_latency": gbm_full.inference_time,
                         "energy_reduction": 0.0,
+                        "work_reduction": 0.0,
                     },
+                    y_test=y_test,
                 )
             )
             LOGGER.info("[%s] Full GBM acc=%.4f time=%.4fs", spec.name, gbm_full.accuracy, gbm_full.inference_time)
 
-        # --- LazyGBM: single operating point or SPRT threshold sweep ---
+        # --- LazyGBM: single operating point or stability-threshold sweep ---
         if should_run("lazy_gbm"):
             if getattr(args, "lazy_gbm_thresholds", None):
                 gbm_thresholds = sorted({float(t) for t in args.lazy_gbm_thresholds})
             else:
                 gbm_thresholds = [float(args.lazy_gbm_threshold)]
+            variant_config = _lazy_gbm_variant_config(args)
 
             for spr_thr in gbm_thresholds:
                 try:
-                    name = "LazyGBM" if len(gbm_thresholds) == 1 else f"LazyGBM[s={spr_thr:.2f}]"
+                    if len(gbm_thresholds) == 1 and variant_config["variant"] == "current":
+                        name = "LazyGBM"
+                    else:
+                        name = f"LazyGBM[{variant_config['variant']},s={spr_thr:.2f}]"
                     lazy_gbm_result = evaluate_lazy_gbm(
                         gbm_full,
                         X_test,
                         y_test,
                         spr_threshold=spr_thr,
                         min_trees=args.lazy_gbm_min_trees,
+                        variant_config=variant_config,
                         name=name,
                     )
-                    results.append(baseline_summary(lazy_gbm_result, summarize_metrics(gbm_full, lazy_gbm_result)))
+                    results.append(baseline_summary(lazy_gbm_result, summarize_metrics(gbm_full, lazy_gbm_result), y_test=y_test))
                     LOGGER.info(
-                        "[%s] %s acc=%.4f avg_trees=%.1f spr_threshold=%.2f",
+                        "[%s] %s acc=%.4f avg_trees=%.1f stability_threshold=%.2f",
                         spec.name,
                         name,
                         lazy_gbm_result.accuracy,
@@ -703,11 +881,11 @@ def format_table(dataset: str, report: Dict[str, Any]) -> str:
     lines.append(
         f"Type: {report['metadata']['type']} | Features: {report['metadata']['features']} | Instances: {report['metadata']['instances']}"
     )
-    columns = ["Method", "Acc", "Speedup", "Acc Drop", "Worst-Case (s)", "Energy Δ"]
+    columns = ["Method", "Acc", "Speedup", "Acc Drop", "Disagree", "Worst-Case (s)", "WorkRed"]
     rows: List[List[str]] = []
     for entry in report["results"]:
         if "metrics" not in entry:
-            rows.append([entry.get("name", "N/A"), "n/a", "n/a", "n/a", "n/a", "n/a"])
+            rows.append([entry.get("name", "N/A"), "n/a", "n/a", "n/a", "n/a", "n/a", "n/a"])
             continue
         metrics = entry["metrics"]
         rows.append(
@@ -716,8 +894,9 @@ def format_table(dataset: str, report: Dict[str, Any]) -> str:
                 f"{entry['accuracy']:.4f}",
                 f"{metrics['speedup']:.2f}",
                 f"{metrics['accuracy_drop']:.4f}",
+                f"{metrics.get('disagreement_rate', float('nan')):.4f}",
                 f"{metrics['worst_case_latency']:.4f}",
-                f"{metrics['energy_reduction']*100:.1f}%",
+                f"{metrics.get('work_reduction', metrics.get('energy_reduction', 0.0))*100:.1f}%",
             ]
         )
     col_widths = [max(len(col), max((len(row[i]) for row in rows), default=0)) for i, col in enumerate(columns)]
@@ -755,7 +934,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lazy-rf-threshold", type=float, default=0.95,
                         help="Default LazyRF posterior threshold when no sweep is requested.")
     parser.add_argument("--lazy-rf-min-trees", type=int, default=10,
-                        help="Minimum number of trees before LazyRF can stop.")
+                        help="Minimum number of evaluated trees before a block-boundary LazyRF stop check can trigger.")
+    parser.add_argument("--lazy-rf-block-size", type=int, default=10,
+                        help="Number of trees evaluated per LazyRF block; stop checks occur only at block boundaries.")
     parser.add_argument(
         "--lazy-rf-thresholds",
         type=float,
@@ -771,18 +952,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--early-exit-threshold2", type=float, default=0.3)
     parser.add_argument("--early-exit-epochs", type=int, default=5)
     parser.add_argument("--gbm-trees", type=int, default=100)
-    # LazyGBM: single operating point and optional SPRT threshold sweep
+    # LazyGBM: single operating point and optional stability-threshold sweep
     parser.add_argument("--lazy-gbm-threshold", type=float, default=3.0,
-                        help="Default LazyGBM SPRT threshold (log-likelihood ratio).")
+                        help="Default LazyGBM stability/flip-score threshold.")
     parser.add_argument("--lazy-gbm-min-trees", type=int, default=10,
                         help="Minimum number of boosting stages before LazyGBM can stop.")
+    parser.add_argument("--lazy-gbm-block-size", type=int, default=1,
+                        help="Number of boosting stages evaluated between LazyGBM stop checks.")
+    parser.add_argument(
+        "--lazy-gbm-variant",
+        type=str,
+        default="current",
+        choices=["current", "certificate_only", "certificate_plus_flip"],
+        help=(
+            "Prototype stopping variant for LazyGBM. "
+            "'current' matches the implementation used in the manuscript; "
+            "'certificate_only' disables all heuristics beyond the residual-capacity certificate; "
+            "'certificate_plus_flip' keeps only the flip-score heuristic in addition to the certificate."
+        ),
+    )
+    parser.add_argument("--lazy-gbm-ratio-threshold", type=float, default=1.5,
+                        help="Margin-to-bound ratio used by the multiclass ratio heuristic.")
+    parser.add_argument("--lazy-gbm-flip-scale", type=float, default=2.0,
+                        help="Multiplier applied to the flip-score threshold in multiclass LazyGBM.")
+    parser.add_argument("--lazy-gbm-late-margin-fraction", type=float, default=0.8,
+                        help="Fraction of total stages after which the late positive-margin fallback is enabled.")
     parser.add_argument(
         "--lazy-gbm-thresholds",
         type=float,
         nargs="*",
         default=None,
         help=(
-            "Optional list of LazyGBM SPRT thresholds to sweep. "
+            "Optional list of LazyGBM stability/flip-score thresholds to sweep. "
             "If provided, LazyGBM is evaluated once per threshold and the single "
             "--lazy-gbm-threshold value is ignored."
         ),
